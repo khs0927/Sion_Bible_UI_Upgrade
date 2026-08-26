@@ -3,10 +3,8 @@ import { dirname, resolve } from 'node:path';
 import {
   DEFAULT_DEEP_MODEL,
   DEFAULT_PRIMARY_FAST_MODEL,
-  DEFAULT_QUALITY_MODEL,
   DEFAULT_QUALITY_MODEL_FALLBACK,
   DEFAULT_SECONDARY_FAST_MODEL,
-  PREFERRED_NVIDIA_MODELS,
   dedupeModels,
   filterLikelyChatModels,
   listNvidiaModels,
@@ -15,6 +13,41 @@ import {
 const BENCHMARK_CACHE_PATH = resolve(process.cwd(), 'data/generated/nvidia-model-benchmarks.json');
 const DEFAULT_BENCHMARK_TTL_MS = 86_400_000;
 const DEFAULT_DISCOVERY_TTL_MS = 21_600_000;
+
+// NVIDIA hosted endpoint availability changes frequently. Keep this list intentionally
+// short and validate it against GET /v1/models before using it.
+const CURRENT_HOSTED_MODELS = {
+  primaryFast: [
+    'google/gemma-4-31b-it',
+    'openai/gpt-oss-20b',
+    'meta/llama-3.1-8b-instruct',
+  ],
+  secondaryFast: [
+    'openai/gpt-oss-20b',
+    'openai/gpt-oss-120b',
+    'google/gemma-4-31b-it',
+    'meta/llama-3.1-8b-instruct',
+  ],
+  quality: [
+    'openai/gpt-oss-120b',
+    'google/gemma-4-31b-it',
+    'nvidia/nemotron-3-super-120b-a12b',
+    'nvidia/llama-3.3-nemotron-super-49b-v1',
+  ],
+  deep: [
+    'nvidia/nemotron-3-super-120b-a12b',
+    'google/gemma-4-31b-it',
+    'openai/gpt-oss-120b',
+  ],
+};
+
+// These models were previously preferred by this app, but their NVIDIA hosted
+// endpoints have since been deprecated. They may still exist as downloadable or
+// partner endpoints, so only exclude them from the free hosted API race.
+const DEPRECATED_HOSTED_MODELS = new Set([
+  'qwen/qwen3.5-122b-a10b',
+  'qwen/qwen3.5-397b-a17b',
+]);
 
 let memoryBenchmarkCache = null;
 let recommendedModelCache = null;
@@ -44,6 +77,10 @@ function isFresh(isoDate, ttl = benchmarkTtlMs()) {
 
 function compactModels(models) {
   return dedupeModels(models).filter(Boolean);
+}
+
+function withoutDeprecatedHostedModels(models) {
+  return compactModels(models).filter((model) => !DEPRECATED_HOSTED_MODELS.has(model));
 }
 
 function withCache(result) {
@@ -90,7 +127,7 @@ export function getConfiguredModels() {
 }
 
 function chooseFirst(available, candidates, fallback) {
-  return candidates.find((model) => model && available.includes(model)) || fallback;
+  return candidates.find((model) => model && available.includes(model)) || available[0] || fallback;
 }
 
 function modelsFromBenchmark(cache) {
@@ -111,17 +148,75 @@ function normalizeRecommendation(recommended, source) {
     deepModel: recommended.deepModel || DEFAULT_DEEP_MODEL,
     source,
     ...(recommended.discoveredModels ? { discoveredModels: recommended.discoveredModels } : {}),
+    ...(recommended.staleConfiguredModels?.length ? { staleConfiguredModels: recommended.staleConfiguredModels } : {}),
+  };
+}
+
+function recommendationFromAvailable(available, configured = {}) {
+  const strictEnv = envFlag(process.env.NVIDIA_MODEL_STRICT_ENV, false);
+  const configuredValues = compactModels(Object.values(configured));
+  const staleConfiguredModels = configuredValues.filter((model) => !available.includes(model));
+
+  const slotCandidates = (currentCandidates, configuredCandidate) => strictEnv
+    ? [configuredCandidate, ...currentCandidates]
+    : [...currentCandidates, configuredCandidate];
+
+  return {
+    primaryFastModel: chooseFirst(
+      available,
+      slotCandidates(CURRENT_HOSTED_MODELS.primaryFast, configured.primaryFastModel),
+      DEFAULT_PRIMARY_FAST_MODEL,
+    ),
+    secondaryFastModel: chooseFirst(
+      available,
+      slotCandidates(CURRENT_HOSTED_MODELS.secondaryFast, configured.secondaryFastModel),
+      DEFAULT_SECONDARY_FAST_MODEL,
+    ),
+    qualityModel: chooseFirst(
+      available,
+      slotCandidates(CURRENT_HOSTED_MODELS.quality, configured.qualityModel),
+      DEFAULT_QUALITY_MODEL_FALLBACK,
+    ),
+    deepModel: chooseFirst(
+      available,
+      slotCandidates(CURRENT_HOSTED_MODELS.deep, configured.deepModel),
+      DEFAULT_DEEP_MODEL,
+    ),
+    discoveredModels: available,
+    staleConfiguredModels,
   };
 }
 
 export async function getRecommendedNvidiaModels({ forceRefresh = false } = {}) {
-  const configured = getConfiguredModels();
-  if (compactModels(Object.values(configured)).length > 0) {
-    return normalizeRecommendation(configured, 'env');
-  }
-
   if (!forceRefresh && recommendedModelCache && recommendedModelCache.expiresAt > Date.now()) {
     return recommendedModelCache.value;
+  }
+
+  const configured = getConfiguredModels();
+  const hasConfiguredModels = compactModels(Object.values(configured)).length > 0;
+
+  // Always prefer a live /models check when enabled. NVIDIA removes hosted models
+  // over time, so treating environment variables as permanent truth caused the app
+  // to keep racing stale endpoints and silently fall back to local copy.
+  if (envFlag(process.env.NVIDIA_MODEL_DISCOVERY, true)) {
+    try {
+      const discovered = withoutDeprecatedHostedModels(filterLikelyChatModels(await listNvidiaModels()));
+      if (discovered.length > 0) {
+        const recommendation = recommendationFromAvailable(discovered, configured);
+        return withCache(normalizeRecommendation(
+          recommendation,
+          hasConfiguredModels ? 'env+live-discovery' : 'live-discovery',
+        ));
+      }
+    } catch (error) {
+      console.warn('NVIDIA model discovery failed:', error?.message || error);
+    }
+  }
+
+  // If discovery itself is temporarily unavailable, keep configured models as a
+  // resilience fallback instead of disabling AI entirely.
+  if (hasConfiguredModels) {
+    return withCache(normalizeRecommendation(configured, 'env-unverified'));
   }
 
   const benchmark = await loadBenchmarkCache();
@@ -130,50 +225,16 @@ export async function getRecommendedNvidiaModels({ forceRefresh = false } = {}) 
     return withCache(normalizeRecommendation(benchmarkModels, 'benchmark-cache'));
   }
 
-  if (envFlag(process.env.NVIDIA_MODEL_DISCOVERY, true)) {
-    try {
-      const discovered = filterLikelyChatModels(await listNvidiaModels());
-      const available = discovered.length > 0 ? discovered : PREFERRED_NVIDIA_MODELS;
-      const recommendation = {
-        primaryFastModel: chooseFirst(available, [
-          'openai/gpt-oss-20b',
-          'meta/llama-3.1-8b-instruct',
-          DEFAULT_PRIMARY_FAST_MODEL,
-        ], DEFAULT_PRIMARY_FAST_MODEL),
-        secondaryFastModel: chooseFirst(available, [
-          'qwen/qwen3.5-122b-a10b',
-          'openai/gpt-oss-20b',
-          DEFAULT_SECONDARY_FAST_MODEL,
-        ], DEFAULT_SECONDARY_FAST_MODEL),
-        qualityModel: chooseFirst(available, [
-          'qwen/qwen3.5-397b-a17b',
-          'openai/gpt-oss-120b',
-          DEFAULT_QUALITY_MODEL,
-          DEFAULT_QUALITY_MODEL_FALLBACK,
-        ], DEFAULT_QUALITY_MODEL_FALLBACK),
-        deepModel: chooseFirst(available, [
-          'openai/gpt-oss-120b',
-          'qwen/qwen3.5-397b-a17b',
-          DEFAULT_DEEP_MODEL,
-        ], DEFAULT_DEEP_MODEL),
-        discoveredModels: discovered,
-      };
-      return withCache(normalizeRecommendation(recommendation, 'discovery'));
-    } catch (error) {
-      console.warn('NVIDIA model discovery failed:', error?.message || error);
-    }
-  }
-
   return withCache(normalizeRecommendation({}, 'defaults'));
 }
 
 export async function resolveNvidiaModelsForVerseDevotion() {
   const recommended = await getRecommendedNvidiaModels();
   const modelsForRace = compactModels([
-    recommended.qualityModel,
     recommended.primaryFastModel,
+    recommended.qualityModel,
     recommended.secondaryFastModel,
-  ]);
+  ]).slice(0, 3);
 
   return {
     ...recommended,
