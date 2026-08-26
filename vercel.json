@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "ignoreCommand": "if [ \"$VERCEL_PROJECT_ID\" = \"prj_xdqg6zE4YJSYJiacj19Omj72L0vo\" ]; then exit 1; else echo 'Skipping legacy duplicate Vercel project'; exit 0; fi",
+  "ignoreCommand": "if [ \"$VERCEL_PROJECT_ID\" = \"prj_0XsqsMyi7j3PQDLIyIK1oIS7XY5a\" ]; then exit 1; else echo 'Skipping unrelated duplicate Vercel project'; exit 0; fi",
   "rewrites": [
     {
       "source": "/((?!api/.*|.*\\..*).*)",
